@@ -24,7 +24,7 @@ COPY prisma/schema.prisma prisma/schema.prisma
 RUN npx prisma generate
 
 FROM node:18-alpine
-RUN apk add --no-cache ffmpeg
+RUN apk add --no-cache ffmpeg unzip
 WORKDIR /app
 COPY --from=PRODUCTION_PACKAGE /app/node_modules /app/node_modules
 COPY package.json /app/package.json
