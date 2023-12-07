@@ -1,21 +1,56 @@
-import { ConsoleLogger, Injectable } from '@nestjs/common';
-import { getPost } from './pixiv';
+import {
+  Injectable,
+  OnApplicationBootstrap,
+} from '@nestjs/common';
+import {
+  IllustType,
+  getArtwork,
+  getArtworkAnimation,
+} from './pixiv';
 import fetch from 'node-fetch';
 import { PrismaService } from 'nestjs-prisma';
 import { upload } from './attachmentUploader';
 import { SizeExtractor } from '@khoohaoyit/image-size';
-import { basename } from 'path';
+import {
+  basename,
+  join,
+} from 'path';
 import { pipeline } from 'stream/promises';
+import {
+  mkdir,
+  mkdtemp,
+  rm,
+  stat,
+  writeFile,
+} from 'fs/promises';
+import { tmpdir } from 'os';
+import { createReadStream, createWriteStream } from 'fs';
+import { spawn } from 'child_process';
 
 @Injectable()
-export class AppService {
+export class AppService implements OnApplicationBootstrap {
+
+  tmpFolder = join(tmpdir(), 'pixiv-api');
 
   constructor(
     private prisma: PrismaService,
   ) { }
 
+  async onApplicationBootstrap() {
+    await rm(this.tmpFolder, { recursive: true, force: true });
+    await mkdir(this.tmpFolder);
+    const unzip = spawn('unzip', ['-v']);
+    await new Promise(rs => unzip.once('exit', rs));
+    if (unzip.exitCode)
+      throw new Error(`Failed to run \`unzip\` at startup`);
+    const ffmpeg = spawn('ffmpeg', ['-version']);
+    await new Promise(rs => ffmpeg.once('exit', rs));
+    if (ffmpeg.exitCode)
+      throw new Error(`Failed to run \`ffmpeg\` at startup`);
+  }
+
   async scrapePost(postId: string) {
-    const data = await getPost(postId);
+    const data = await getArtwork(postId);
     await Promise.all([
       this.#handleAttachments(data),
       this.#handleArtwork(data),
@@ -23,7 +58,7 @@ export class AppService {
     ]);
   }
 
-  async #handleUser(post: Awaited<ReturnType<typeof getPost>>) {
+  async #handleUser(post: Awaited<ReturnType<typeof getArtwork>>) {
     await this.#ensureUserUpdated({
       id: post.author.id,
       avatar: {
@@ -88,10 +123,9 @@ export class AppService {
     });
   }
 
-  async #handleArtwork(post: Awaited<ReturnType<typeof getPost>>) {
+  async #handleArtwork(post: Awaited<ReturnType<typeof getArtwork>>) {
     await this.#ensureArtworkUpdated({
       id: post.id,
-      attachmentIds: post.attachments.map(attachment => attachment.id),
       bookmarks: post.bookmarks,
       comments: post.comments,
       description: post.description,
@@ -105,14 +139,14 @@ export class AppService {
   async #ensureArtworkUpdated(
     post: {
       id: string
-      attachmentIds: string[]
-      bookmarks: number,
-      comments: number
-      description: string
-      likes: number
-      title: string
-      views: number
-      authorId: string
+      attachmentIds?: string[]
+      bookmarks?: number,
+      comments?: number
+      description?: string
+      likes?: number
+      title?: string
+      views?: number
+      authorId?: string
     }
   ) {
     await this.prisma.artwork.upsert({
@@ -125,12 +159,14 @@ export class AppService {
         likes: post.likes,
         title: post.title,
         views: post.views,
-        author: {
-          connectOrCreate: {
-            where: { id: post.authorId },
-            create: { id: post.authorId },
-          },
-        },
+        author: post.authorId
+          ? {
+            connectOrCreate: {
+              where: { id: post.authorId },
+              create: { id: post.authorId },
+            },
+          }
+          : undefined,
       },
       create: {
         id: post.id,
@@ -141,19 +177,102 @@ export class AppService {
         likes: post.likes,
         title: post.title,
         views: post.views,
-        author: {
-          connectOrCreate: {
-            where: { id: post.authorId },
-            create: { id: post.authorId },
-          },
-        },
+        author: post.authorId
+          ? {
+            connectOrCreate: {
+              where: { id: post.authorId },
+              create: { id: post.authorId },
+            },
+          }
+          : undefined,
       }
     });
   }
 
-  async #handleAttachments(post: Awaited<ReturnType<typeof getPost>>) {
-    await Promise.all(post.attachments.map(attachment =>
-      this.#ensureAttachmentExists(attachment)));
+  async #handleAttachments(post: Awaited<ReturnType<typeof getArtwork>>) {
+    switch (post.type) {
+      default: {
+        await Promise.all(post.attachments.map(attachment =>
+          this.#ensureAttachmentExists(attachment)));
+        await this.#ensureArtworkUpdated({
+          id: post.id,
+          attachmentIds: post.attachments.map(attachment => attachment.id),
+        });
+      } break;
+      case IllustType.Animation: {
+        const animation = await getArtworkAnimation(post.id);
+        const found = await this.prisma.attachment.findUnique({
+          where: { id: animation.id },
+        });
+        if (found)
+          break;
+        const workingDir = await mkdtemp(join(this.tmpFolder, `${post.id}-`));
+        const gifResult = await fetch(animation.zipUrl, {
+          headers: { referer: 'https://www.pixiv.net/' },
+        }).then(async res => {
+          if (!res.ok)
+            throw new Error(`${basename(animation.zipUrl)} returned status code: ${res.status}`);
+          await pipeline(
+            res.body,
+            createWriteStream(join(workingDir, 'images.zip')),
+          );
+          const unzip = spawn(
+            'unzip',
+            ['images.zip', '-d', 'images'],
+            { cwd: workingDir },
+          );
+          await new Promise(rs => unzip.once('exit', rs));
+          if (unzip.exitCode)
+            throw new Error(`unzip exited with code: ${unzip.exitCode}`);
+          await writeFile(
+            join(workingDir, 'images', 'input.txt'),
+            animation.frames
+              .map(frame => `file '${frame.file}'\nduration ${frame.delay / 1_000}`)
+              .join('\n'),
+          );
+          const ffmpeg = spawn(
+            'ffmpeg',
+            [
+              '-f', 'concat',
+              '-i', 'input.txt',
+              '-vf', '[0]split[v][p];[p]palettegen=stats_mode=diff:max_colors=256:reserve_transparent=1[p];[v][p]paletteuse=new=1:alpha_threshold=1:diff_mode=rectangle',
+              '-loop', '0',
+              'output.gif',
+            ],
+            { cwd: join(workingDir, 'images') },
+          );
+          await new Promise(rs => ffmpeg.once('exit', rs));
+          if (ffmpeg.exitCode)
+            throw new Error(`ffmpeg exited with code: ${ffmpeg.exitCode}`);
+          const gifPath = join(workingDir, 'images', 'output.gif');
+          const gifStat = await stat(gifPath);
+          const sizeExtractor = new SizeExtractor({ passthrough: true });
+          const [attachment] = await Promise.all([
+            upload({ stream: sizeExtractor, size: gifStat.size }, animation.id + '.gif'),
+            pipeline(createReadStream(gifPath), sizeExtractor),
+          ]);
+          const [[{ width, height }]] = sizeExtractor.sizes;
+          return {
+            width, height,
+            url: attachment.url,
+          };
+        }).finally(() => rm(workingDir, { recursive: true }));
+        if (!gifResult)
+          break;
+        await this.prisma.attachment.create({
+          data: {
+            id: animation.id,
+            url: gifResult.url,
+            width: gifResult.width,
+            height: gifResult.height,
+          },
+        });
+        await this.#ensureArtworkUpdated({
+          id: post.id,
+          attachmentIds: [animation.id],
+        });
+      } break;
+    }
   }
 
   async #ensureAttachmentExists(
